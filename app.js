@@ -18,8 +18,11 @@ document.addEventListener("DOMContentLoaded", () => {
     nextPageId: 1,
     nextSourceId: 1,
     dragPageId: null,
+    editingPageId: null,
     isImporting: false,
     isExporting: false,
+    autoScrollFrameId: null,
+    autoScrollSpeed: 0,
     statusText: "Ready for import",
   }
 
@@ -108,20 +111,33 @@ document.addEventListener("DOMContentLoaded", () => {
 
     elements.pages.addEventListener("click", (event) => {
       const deleteButton = event.target.closest("[data-action='delete-page']")
-      if (!deleteButton) {
+      if (deleteButton) {
+        const pageId = Number(deleteButton.closest("[data-page-id]")?.dataset.pageId)
+        deletePage(pageId)
         return
       }
 
-      const pageId = Number(deleteButton.closest("[data-page-id]")?.dataset.pageId)
-      deletePage(pageId)
+      const editOrderButton = event.target.closest("[data-action='edit-order']")
+      if (!editOrderButton) {
+        return
+      }
+
+      const pageId = Number(editOrderButton.closest("[data-page-id]")?.dataset.pageId)
+      beginOrderEdit(pageId)
     })
 
     elements.pages.addEventListener("dragstart", (event) => {
+      if (event.target.closest("[data-prevent-card-drag='true']")) {
+        event.preventDefault()
+        return
+      }
+
       const card = event.target.closest("[data-page-id]")
       if (!card) {
         return
       }
 
+      state.editingPageId = null
       state.dragPageId = Number(card.dataset.pageId)
       card.classList.add("dragging")
       if (event.dataTransfer) {
@@ -140,6 +156,7 @@ document.addEventListener("DOMContentLoaded", () => {
       }
 
       event.preventDefault()
+      updateAutoScroll(event.clientY)
       const card = event.target.closest("[data-page-id]")
       clearDropMarkers()
 
@@ -169,6 +186,38 @@ document.addEventListener("DOMContentLoaded", () => {
       const placement = getPlacement(card, event)
       movePage(state.dragPageId, targetId, placement)
       finishDrag()
+    })
+
+    elements.pages.addEventListener("keydown", (event) => {
+      const orderInput = event.target.closest("[data-action='commit-order']")
+      if (!orderInput) {
+        return
+      }
+
+      if (event.key === "Enter") {
+        event.preventDefault()
+        commitOrderEdit(Number(orderInput.dataset.pageId), orderInput.value)
+      } else if (event.key === "Escape") {
+        event.preventDefault()
+        cancelOrderEdit()
+      }
+    })
+
+    elements.pages.addEventListener("focusout", (event) => {
+      const orderInput = event.target.closest("[data-action='commit-order']")
+      if (!orderInput) {
+        return
+      }
+
+      commitOrderEdit(Number(orderInput.dataset.pageId), orderInput.value)
+    })
+
+    document.addEventListener("dragover", (event) => {
+      if (state.dragPageId == null) {
+        return
+      }
+
+      updateAutoScroll(event.clientY)
     })
   }
 
@@ -336,6 +385,34 @@ document.addEventListener("DOMContentLoaded", () => {
     state.statusText = "Page moved to the end"
   }
 
+  function movePageToPosition(pageId, rawPosition) {
+    const fromIndex = state.pages.findIndex((page) => page.id === pageId)
+    if (fromIndex === -1) {
+      return
+    }
+
+    const requestedPosition = Number.parseInt(String(rawPosition), 10)
+    if (!Number.isFinite(requestedPosition)) {
+      state.statusText = "Page move canceled"
+      render()
+      return
+    }
+
+    const targetPosition = clamp(requestedPosition, 1, state.pages.length)
+    if (targetPosition === fromIndex + 1) {
+      state.statusText = "Page position unchanged"
+      render()
+      revealPageCard(pageId)
+      return
+    }
+
+    const [moved] = state.pages.splice(fromIndex, 1)
+    state.pages.splice(targetPosition - 1, 0, moved)
+    state.statusText = `Moved page to position ${targetPosition}`
+    render()
+    revealPageCard(pageId)
+  }
+
   async function exportCombinedPdf() {
     if (state.pages.length === 0 || state.isImporting || state.isExporting || !hasPdfLib) {
       return
@@ -382,6 +459,8 @@ document.addEventListener("DOMContentLoaded", () => {
     state.sources.clear()
     state.messages = []
     state.dragPageId = null
+    state.editingPageId = null
+    stopAutoScroll()
     state.statusText = "Ready for import"
     render()
   }
@@ -444,14 +523,35 @@ document.addEventListener("DOMContentLoaded", () => {
       const header = document.createElement("div")
       header.className = "page-card-header"
 
-      const order = document.createElement("span")
-      order.className = "page-order"
-      order.textContent = String(index + 1)
+      let order
+      if (state.editingPageId === page.id) {
+        order = document.createElement("input")
+        order.type = "number"
+        order.min = "1"
+        order.max = String(state.pages.length)
+        order.value = String(index + 1)
+        order.className = "page-order page-order-input"
+        order.dataset.action = "commit-order"
+        order.dataset.pageId = String(page.id)
+        order.dataset.preventCardDrag = "true"
+        order.inputMode = "numeric"
+        order.setAttribute("aria-label", `Enter a new position for ${page.sourceName}`)
+      } else {
+        order = document.createElement("button")
+        order.type = "button"
+        order.className = "page-order page-order-button"
+        order.dataset.action = "edit-order"
+        order.dataset.preventCardDrag = "true"
+        order.textContent = String(index + 1)
+        order.setAttribute("aria-label", `Edit the position for ${page.sourceName}`)
+        order.title = "Click to move this page by number"
+      }
 
       const deleteButton = document.createElement("button")
       deleteButton.type = "button"
       deleteButton.className = "button delete-button"
       deleteButton.dataset.action = "delete-page"
+      deleteButton.dataset.preventCardDrag = "true"
       deleteButton.textContent = "Delete"
       deleteButton.setAttribute("aria-label", `Delete page ${page.sourcePageNumber} from ${page.sourceName}`)
 
@@ -478,12 +578,24 @@ document.addEventListener("DOMContentLoaded", () => {
 
       const note = document.createElement("p")
       note.className = "page-note"
-      note.textContent = "Drag to reorder in the final booklet"
+      note.textContent = "Click the number to jump positions or drag to reorder"
 
       meta.append(title, source, note)
       card.append(header, preview, meta)
       elements.pages.append(card)
     })
+
+    if (state.editingPageId != null) {
+      requestAnimationFrame(() => {
+        const activeEditor = elements.pages.querySelector("[data-action='commit-order']")
+        if (!activeEditor) {
+          return
+        }
+
+        activeEditor.focus()
+        activeEditor.select()
+      })
+    }
   }
 
   function renderButtons() {
@@ -526,7 +638,36 @@ document.addEventListener("DOMContentLoaded", () => {
   function finishDrag() {
     state.dragPageId = null
     clearDropMarkers()
+    stopAutoScroll()
     render()
+  }
+
+  function beginOrderEdit(pageId) {
+    if (!Number.isFinite(pageId)) {
+      return
+    }
+
+    state.editingPageId = pageId
+    render()
+  }
+
+  function cancelOrderEdit() {
+    if (state.editingPageId == null) {
+      return
+    }
+
+    state.editingPageId = null
+    state.statusText = "Page move canceled"
+    render()
+  }
+
+  function commitOrderEdit(pageId, rawValue) {
+    if (state.editingPageId !== pageId) {
+      return
+    }
+
+    state.editingPageId = null
+    movePageToPosition(pageId, rawValue)
   }
 
   function getPlacement(card, event) {
@@ -540,6 +681,61 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function looksLikePdf(file) {
     return file.type === "application/pdf" || /\.pdf$/i.test(file.name)
+  }
+
+  function revealPageCard(pageId) {
+    requestAnimationFrame(() => {
+      const pageCard = elements.pages.querySelector(`[data-page-id='${pageId}']`)
+      if (!pageCard) {
+        return
+      }
+
+      pageCard.scrollIntoView({
+        block: "nearest",
+        inline: "nearest",
+        behavior: "smooth",
+      })
+    })
+  }
+
+  function updateAutoScroll(pointerY) {
+    const edgeThreshold = 110
+    const distanceFromBottom = window.innerHeight - pointerY
+    let nextSpeed = 0
+
+    if (pointerY < edgeThreshold) {
+      nextSpeed = -Math.ceil((edgeThreshold - pointerY) / 10)
+    } else if (distanceFromBottom < edgeThreshold) {
+      nextSpeed = Math.ceil((edgeThreshold - distanceFromBottom) / 10)
+    }
+
+    state.autoScrollSpeed = nextSpeed
+
+    if (nextSpeed !== 0 && state.autoScrollFrameId == null) {
+      state.autoScrollFrameId = window.requestAnimationFrame(runAutoScrollFrame)
+    }
+  }
+
+  function runAutoScrollFrame() {
+    if (state.dragPageId == null) {
+      stopAutoScroll()
+      return
+    }
+
+    if (state.autoScrollSpeed !== 0) {
+      window.scrollBy(0, state.autoScrollSpeed)
+    }
+
+    state.autoScrollFrameId = window.requestAnimationFrame(runAutoScrollFrame)
+  }
+
+  function stopAutoScroll() {
+    if (state.autoScrollFrameId != null) {
+      window.cancelAnimationFrame(state.autoScrollFrameId)
+      state.autoScrollFrameId = null
+    }
+
+    state.autoScrollSpeed = 0
   }
 
   function getActiveSourceCount() {
@@ -562,5 +758,9 @@ document.addEventListener("DOMContentLoaded", () => {
   function isPasswordError(error) {
     const message = String(error?.message || "")
     return error?.name === "PasswordException" || /password|encrypted|encryption/i.test(message)
+  }
+
+  function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max)
   }
 })
