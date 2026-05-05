@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Offline PDF Booklet Editor</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="hero">
+        <p class="eyebrow">Offline PDF booklet editor</p>
+        <h1>Merge, reorder, and trim PDFs without Acrobat</h1>
+        <p class="hero-copy">
+          Drop in local PDFs, drag pages into the right order, remove the ones you do not need,
+          and export one clean combined file.
+        </p>
+
+        <div class="toolbar" aria-label="Primary actions">
+          <label class="button primary" for="file-input">Add PDFs</label>
+          <input id="file-input" type="file" accept="application/pdf,.pdf" multiple hidden>
+          <button id="export-btn" class="button accent" type="button" disabled>
+            Export Combined PDF
+          </button>
+          <button id="clear-btn" class="button ghost" type="button" disabled>
+            Reset
+          </button>
+        </div>
+
+        <div
+          id="drop-zone"
+          class="drop-zone"
+          role="button"
+          tabindex="0"
+          aria-describedby="drop-zone-copy"
+        >
+          <div>
+            <strong>Drop PDFs here</strong>
+            <p id="drop-zone-copy">Or click “Add PDFs” to choose files from local storage.</p>
+          </div>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="workspace-bar" aria-label="Document summary">
+          <div id="summary" class="summary">No files loaded</div>
+          <div id="status" class="status">Ready for import</div>
+        </section>
+
+        <section id="message-list" class="message-list" aria-live="polite"></section>
+
+        <section id="empty-state" class="empty-state">
+          <h2>Your booklet will appear here</h2>
+          <p>
+            Imported pages are flattened into one sequence so employees can reorder or delete
+            pages before exporting the final PDF.
+          </p>
+        </section>
+
+        <section
+          id="pages"
+          class="pages"
+          aria-label="Imported PDF pages"
+        ></section>
+      </main>
+    </div>
+
+    <script defer src="./vendor/pdf-lib.min.js"></script>
+    <script defer src="./vendor/pdf.min.js"></script>
+    <script defer src="./app.js"></script>
+  </body>
+</html>
