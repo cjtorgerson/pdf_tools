@@ -9,7 +9,18 @@ document.addEventListener("DOMContentLoaded", () => {
     summary: document.getElementById("summary"),
     status: document.getElementById("status"),
     messages: document.getElementById("message-list"),
+    previewModal: document.getElementById("preview-modal"),
+    previewClose: document.getElementById("preview-close"),
+    previewKicker: document.getElementById("preview-kicker"),
+    previewTitle: document.getElementById("preview-title"),
+    previewStage: document.getElementById("preview-stage"),
   }
+
+  const pageElements = new Map()
+  const pageRefs = new Map()
+  const thumbnailQueue = []
+  const queuedThumbnailIds = new Set()
+  let activeThumbnailJobs = 0
 
   const state = {
     pages: [],
@@ -23,11 +34,21 @@ document.addEventListener("DOMContentLoaded", () => {
     isExporting: false,
     autoScrollFrameId: null,
     autoScrollSpeed: 0,
+    previewPageId: null,
+    previewRenderToken: 0,
     statusText: "Ready for import",
   }
 
+  const THUMBNAIL_WIDTH = 150
+  const THUMBNAIL_CONCURRENCY = 2
   const hasPdfLib = Boolean(window.PDFLib && window.PDFLib.PDFDocument)
   const hasPdfJs = Boolean(window.pdfjsLib)
+  const thumbnailObserver = hasPdfJs
+    ? new IntersectionObserver(handleThumbnailIntersection, {
+        root: null,
+        rootMargin: "320px 0px",
+      })
+    : null
 
   if (hasPdfJs) {
     window.pdfjsLib.GlobalWorkerOptions.workerSrc = "./vendor/pdf.worker.min.js"
@@ -40,10 +61,13 @@ document.addEventListener("DOMContentLoaded", () => {
       "error",
       "Missing local PDF libraries. Ensure vendor/pdf-lib.min.js, vendor/pdf.min.js, and vendor/pdf.worker.min.js are present."
     )
-    elements.fileInput.disabled = true
   }
 
-  render()
+  renderSummary()
+  renderStatus()
+  renderMessages()
+  renderButtons()
+  renderEmptyState()
 
   function bindEvents() {
     elements.fileInput.addEventListener("change", async (event) => {
@@ -56,6 +80,19 @@ document.addEventListener("DOMContentLoaded", () => {
 
     elements.exportButton.addEventListener("click", exportCombinedPdf)
     elements.clearButton.addEventListener("click", clearAll)
+    elements.previewClose.addEventListener("click", closePreview)
+
+    elements.previewModal.addEventListener("click", (event) => {
+      if (event.target === elements.previewModal) {
+        closePreview()
+      }
+    })
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !elements.previewModal.hidden) {
+        closePreview()
+      }
+    })
 
     elements.dropZone.addEventListener("click", () => {
       if (!elements.fileInput.disabled) {
@@ -72,7 +109,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     ;["dragenter", "dragover"].forEach((eventName) => {
       elements.dropZone.addEventListener(eventName, (event) => {
-        if (hasFiles(event)) {
+        if (hasFiles(event) && canImportFiles()) {
           event.preventDefault()
           elements.dropZone.classList.add("is-active")
         }
@@ -86,7 +123,7 @@ document.addEventListener("DOMContentLoaded", () => {
     })
 
     elements.dropZone.addEventListener("drop", async (event) => {
-      if (!hasFiles(event)) {
+      if (!hasFiles(event) || !canImportFiles()) {
         return
       }
 
@@ -110,6 +147,10 @@ document.addEventListener("DOMContentLoaded", () => {
     })
 
     elements.pages.addEventListener("click", (event) => {
+      if (isBusy()) {
+        return
+      }
+
       const deleteButton = event.target.closest("[data-action='delete-page']")
       if (deleteButton) {
         const pageId = Number(deleteButton.closest("[data-page-id]")?.dataset.pageId)
@@ -118,16 +159,23 @@ document.addEventListener("DOMContentLoaded", () => {
       }
 
       const editOrderButton = event.target.closest("[data-action='edit-order']")
-      if (!editOrderButton) {
+      if (editOrderButton) {
+        const pageId = Number(editOrderButton.closest("[data-page-id]")?.dataset.pageId)
+        beginOrderEdit(pageId)
         return
       }
 
-      const pageId = Number(editOrderButton.closest("[data-page-id]")?.dataset.pageId)
-      beginOrderEdit(pageId)
+      const previewButton = event.target.closest("[data-action='open-preview']")
+      if (!previewButton) {
+        return
+      }
+
+      const pageId = Number(previewButton.closest("[data-page-id]")?.dataset.pageId)
+      openPreview(pageId)
     })
 
     elements.pages.addEventListener("dragstart", (event) => {
-      if (event.target.closest("[data-prevent-card-drag='true']")) {
+      if (isBusy() || event.target.closest("[data-prevent-card-drag='true']")) {
         event.preventDefault()
         return
       }
@@ -139,7 +187,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
       state.editingPageId = null
       state.dragPageId = Number(card.dataset.pageId)
-      card.classList.add("dragging")
+      refreshPageCards()
+
       if (event.dataTransfer) {
         event.dataTransfer.effectAllowed = "move"
         event.dataTransfer.setData("text/plain", String(state.dragPageId))
@@ -151,7 +200,7 @@ document.addEventListener("DOMContentLoaded", () => {
     })
 
     elements.pages.addEventListener("dragover", (event) => {
-      if (state.dragPageId == null) {
+      if (state.dragPageId == null || isBusy()) {
         return
       }
 
@@ -169,7 +218,7 @@ document.addEventListener("DOMContentLoaded", () => {
     })
 
     elements.pages.addEventListener("drop", (event) => {
-      if (state.dragPageId == null) {
+      if (state.dragPageId == null || isBusy()) {
         return
       }
 
@@ -222,46 +271,43 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   async function importFiles(files) {
-    if (!hasPdfLib || !hasPdfJs || state.isImporting || state.isExporting) {
+    if (!canImportFiles()) {
       return
     }
 
     state.isImporting = true
-    state.statusText = `Importing ${files.length} file${files.length === 1 ? "" : "s"}...`
-    render()
+    renderButtons()
+    refreshPageInteractivity()
 
-    for (const file of files) {
-      await importSingleFile(file)
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index]
+      setStatus(`Importing ${index + 1} of ${files.length}: ${file.name}`)
+      await importSingleFile(file, index + 1, files.length)
     }
 
     state.isImporting = false
-    state.statusText = state.pages.length > 0 ? "Ready to reorder and export" : "Ready for import"
-    render()
+    setStatus(state.pages.length > 0 ? "Ready to reorder and export" : "Ready for import")
+    renderButtons()
+    refreshPageInteractivity()
   }
 
-  async function importSingleFile(file) {
+  async function importSingleFile(file, fileNumber, totalFiles) {
     if (!looksLikePdf(file)) {
       pushMessage("error", `${file.name} is not a PDF.`)
       return
     }
 
     let sourceBytes
-    let validationBytes
-    let previewBytes
     try {
       const fileBuffer = await file.arrayBuffer()
-
-      // PDF.js may transfer its input into a worker, so export needs an untouched copy.
       sourceBytes = new Uint8Array(fileBuffer.slice(0))
-      validationBytes = sourceBytes.slice()
-      previewBytes = sourceBytes.slice()
     } catch (error) {
       pushMessage("error", `Could not read ${file.name}.`)
       return
     }
 
     try {
-      await window.PDFLib.PDFDocument.load(validationBytes, { ignoreEncryption: false })
+      await window.PDFLib.PDFDocument.load(sourceBytes.slice(), { ignoreEncryption: false })
     } catch (error) {
       if (isPasswordError(error)) {
         pushMessage("error", `${file.name} is password-protected and cannot be imported in this version.`)
@@ -271,12 +317,22 @@ document.addEventListener("DOMContentLoaded", () => {
       return
     }
 
-    let previewDocument
+    const sourceId = state.nextSourceId++
+    const source = {
+      id: sourceId,
+      name: file.name,
+      bytes: sourceBytes,
+      pageCount: 0,
+      pdfjsDocument: null,
+      pdfjsDocumentPromise: null,
+    }
+    state.sources.set(sourceId, source)
+
+    let pdfjsDocument
     try {
-      previewDocument = await window.pdfjsLib.getDocument({
-        data: previewBytes,
-      }).promise
+      pdfjsDocument = await getSourcePdfJsDocument(source)
     } catch (error) {
+      cleanupSource(sourceId)
       if (isPasswordError(error)) {
         pushMessage("error", `${file.name} is password-protected and cannot be imported in this version.`)
       } else {
@@ -285,54 +341,30 @@ document.addEventListener("DOMContentLoaded", () => {
       return
     }
 
-    const sourceId = state.nextSourceId++
-    state.sources.set(sourceId, {
-      id: sourceId,
-      name: file.name,
-      bytes: sourceBytes,
-      pageCount: previewDocument.numPages,
-    })
-
-    for (let pageNumber = 1; pageNumber <= previewDocument.numPages; pageNumber += 1) {
-      const thumbnailUrl = await renderThumbnail(previewDocument, pageNumber)
-      state.pages.push({
-        id: state.nextPageId++,
-        sourceId,
-        sourceName: file.name,
-        sourcePageIndex: pageNumber - 1,
-        sourcePageNumber: pageNumber,
-        thumbnailUrl,
-      })
-      render()
-    }
-
-    if (typeof previewDocument.cleanup === "function") {
-      previewDocument.cleanup()
-    }
-    if (typeof previewDocument.destroy === "function") {
-      previewDocument.destroy()
-    }
-
-    pushMessage("info", `Imported ${file.name} (${previewDocument.numPages} page${previewDocument.numPages === 1 ? "" : "s"}).`)
+    source.pageCount = pdfjsDocument.numPages
+    addImportedPages(source, source.pageCount)
+    setStatus(`Imported ${fileNumber} of ${totalFiles}: ${file.name} (${source.pageCount} pages). Thumbnails load as pages come into view.`)
+    pushMessage("info", `Imported ${file.name} (${source.pageCount} page${source.pageCount === 1 ? "" : "s"}).`)
   }
 
-  async function renderThumbnail(previewDocument, pageNumber) {
-    const page = await previewDocument.getPage(pageNumber)
-    const viewport = page.getViewport({ scale: 1 })
-    const targetWidth = 150
-    const scale = targetWidth / viewport.width
-    const scaledViewport = page.getViewport({ scale })
-    const canvas = document.createElement("canvas")
-    const context = canvas.getContext("2d", { alpha: false })
-    canvas.width = Math.ceil(scaledViewport.width)
-    canvas.height = Math.ceil(scaledViewport.height)
+  function addImportedPages(source, pageCount) {
+    const newPages = []
+    for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
+      newPages.push({
+        id: state.nextPageId++,
+        sourceId: source.id,
+        sourceName: source.name,
+        sourcePageIndex: pageNumber - 1,
+        sourcePageNumber: pageNumber,
+        thumbnailStatus: "idle",
+        thumbnailUrl: null,
+      })
+    }
 
-    await page.render({
-      canvasContext: context,
-      viewport: scaledViewport,
-    }).promise
-
-    return canvas.toDataURL("image/png")
+    state.pages.push(...newPages)
+    syncPageGrid()
+    renderSummary()
+    renderButtons()
   }
 
   function deletePage(pageId) {
@@ -342,10 +374,22 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     const [removed] = state.pages.splice(index, 1)
+    cleanupThumbnailForPage(removed)
+    removePageCard(pageId)
+
+    if (state.previewPageId === pageId) {
+      closePreview()
+    }
+    if (state.editingPageId === pageId) {
+      state.editingPageId = null
+    }
+
     pruneUnusedSources()
+    syncPageGrid()
+    renderSummary()
+    renderButtons()
+    setStatus(state.pages.length > 0 ? "Ready to reorder and export" : "Ready for import")
     pushMessage("info", `Removed page ${removed.sourcePageNumber} from ${removed.sourceName}.`)
-    state.statusText = state.pages.length > 0 ? "Ready to reorder and export" : "Ready for import"
-    render()
   }
 
   function movePage(dragPageId, targetPageId, placement) {
@@ -363,6 +407,8 @@ document.addEventListener("DOMContentLoaded", () => {
     let insertIndex = state.pages.findIndex((page) => page.id === targetPageId)
     if (insertIndex === -1) {
       state.pages.push(moved)
+      syncPageGrid()
+      setStatus("Page order updated")
       return
     }
 
@@ -371,7 +417,8 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     state.pages.splice(insertIndex, 0, moved)
-    state.statusText = "Page order updated"
+    syncPageGrid()
+    setStatus("Page order updated")
   }
 
   function movePageToEnd(pageId) {
@@ -382,7 +429,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const [moved] = state.pages.splice(fromIndex, 1)
     state.pages.push(moved)
-    state.statusText = "Page moved to the end"
+    syncPageGrid()
+    setStatus("Page moved to the end")
   }
 
   function movePageToPosition(pageId, rawPosition) {
@@ -393,43 +441,54 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const requestedPosition = Number.parseInt(String(rawPosition), 10)
     if (!Number.isFinite(requestedPosition)) {
-      state.statusText = "Page move canceled"
-      render()
+      setStatus("Page move canceled")
+      refreshPageCards()
       return
     }
 
     const targetPosition = clamp(requestedPosition, 1, state.pages.length)
     if (targetPosition === fromIndex + 1) {
-      state.statusText = "Page position unchanged"
-      render()
+      setStatus("Page position unchanged")
+      refreshPageCards()
       revealPageCard(pageId)
       return
     }
 
     const [moved] = state.pages.splice(fromIndex, 1)
     state.pages.splice(targetPosition - 1, 0, moved)
-    state.statusText = `Moved page to position ${targetPosition}`
-    render()
+    syncPageGrid()
+    setStatus(`Moved page to position ${targetPosition}`)
     revealPageCard(pageId)
   }
 
   async function exportCombinedPdf() {
-    if (state.pages.length === 0 || state.isImporting || state.isExporting || !hasPdfLib) {
+    if (state.pages.length === 0 || isBusy() || !hasPdfLib) {
       return
     }
 
     state.isExporting = true
-    state.statusText = "Building combined PDF..."
-    render()
+    renderButtons()
+    refreshPageInteractivity()
+    setStatus(`Preparing export for ${state.pages.length} page${state.pages.length === 1 ? "" : "s"}...`)
 
     try {
       const outputDocument = await window.PDFLib.PDFDocument.create()
       const sourceCache = new Map()
 
-      for (const page of state.pages) {
+      for (let index = 0; index < state.pages.length; index += 1) {
+        const page = state.pages[index]
+
+        if (index === 0 || (index + 1) % 10 === 0 || index === state.pages.length - 1) {
+          setStatus(`Exporting page ${index + 1} of ${state.pages.length}...`)
+        }
+
         let sourceDocument = sourceCache.get(page.sourceId)
         if (!sourceDocument) {
           const source = state.sources.get(page.sourceId)
+          if (!source) {
+            continue
+          }
+
           sourceDocument = await window.PDFLib.PDFDocument.load(source.bytes.slice(), {
             ignoreEncryption: false,
           })
@@ -443,38 +502,49 @@ document.addEventListener("DOMContentLoaded", () => {
       const outputBytes = await outputDocument.save()
       downloadBytes(outputBytes, "combined.pdf", "application/pdf")
       pushMessage("info", `Exported combined.pdf with ${state.pages.length} page${state.pages.length === 1 ? "" : "s"}.`)
-      state.statusText = "Combined PDF downloaded"
+      setStatus("Combined PDF downloaded")
     } catch (error) {
       console.error(error)
       pushMessage("error", "The combined PDF could not be exported.")
-      state.statusText = "Export failed"
+      setStatus("Export failed")
     } finally {
       state.isExporting = false
-      render()
+      renderButtons()
+      refreshPageInteractivity()
     }
   }
 
   function clearAll() {
+    stopAutoScroll()
+    closePreview()
+
+    state.pages.forEach(cleanupThumbnailForPage)
     state.pages = []
-    state.sources.clear()
     state.messages = []
     state.dragPageId = null
     state.editingPageId = null
-    stopAutoScroll()
-    state.statusText = "Ready for import"
-    render()
-  }
 
-  function render() {
+    queuedThumbnailIds.clear()
+    thumbnailQueue.length = 0
+
+    for (const pageId of Array.from(pageElements.keys())) {
+      removePageCard(pageId)
+    }
+    elements.pages.replaceChildren()
+
+    for (const sourceId of Array.from(state.sources.keys())) {
+      cleanupSource(sourceId)
+    }
+
     renderSummary()
-    renderStatus()
     renderMessages()
-    renderPages()
     renderButtons()
+    renderEmptyState()
+    setStatus("Ready for import")
   }
 
   function renderSummary() {
-    const fileCount = getActiveSourceCount()
+    const fileCount = state.sources.size
     const pageCount = state.pages.length
 
     if (pageCount === 0) {
@@ -500,104 +570,231 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  function renderPages() {
+  function renderButtons() {
+    const canEdit = state.pages.length > 0 && !isBusy()
+    elements.exportButton.disabled = !canEdit
+    elements.clearButton.disabled = state.pages.length === 0 && state.messages.length === 0
+    elements.clearButton.disabled = elements.clearButton.disabled || isBusy()
+    elements.fileInput.disabled = !canImportFiles()
+    elements.dropZone.classList.toggle("is-disabled", !canImportFiles())
+    elements.dropZone.setAttribute("aria-disabled", String(!canImportFiles()))
+  }
+
+  function renderEmptyState() {
     const hasPages = state.pages.length > 0
     elements.emptyState.hidden = hasPages
     elements.pages.classList.toggle("is-empty", !hasPages)
-    elements.pages.replaceChildren()
+  }
 
-    if (!hasPages) {
+  function syncPageGrid() {
+    renderEmptyState()
+
+    if (state.pages.length === 0) {
+      elements.pages.replaceChildren()
       return
     }
 
-    state.pages.forEach((page, index) => {
-      const card = document.createElement("article")
-      card.className = "page-card"
-      card.draggable = true
-      card.dataset.pageId = String(page.id)
-
-      if (state.dragPageId === page.id) {
-        card.classList.add("dragging")
+    const fragment = document.createDocumentFragment()
+    for (let index = 0; index < state.pages.length; index += 1) {
+      const page = state.pages[index]
+      let card = pageElements.get(page.id)
+      if (!card) {
+        card = createPageCard(page)
       }
 
-      const header = document.createElement("div")
-      header.className = "page-card-header"
+      updatePageCard(page, index)
+      fragment.append(card)
+    }
 
-      let order
-      if (state.editingPageId === page.id) {
-        order = document.createElement("input")
-        order.type = "number"
-        order.min = "1"
-        order.max = String(state.pages.length)
-        order.value = String(index + 1)
-        order.className = "page-order page-order-input"
-        order.dataset.action = "commit-order"
-        order.dataset.pageId = String(page.id)
-        order.dataset.preventCardDrag = "true"
-        order.inputMode = "numeric"
-        order.setAttribute("aria-label", `Enter a new position for ${page.sourceName}`)
-      } else {
-        order = document.createElement("button")
-        order.type = "button"
-        order.className = "page-order page-order-button"
-        order.dataset.action = "edit-order"
-        order.dataset.preventCardDrag = "true"
-        order.textContent = String(index + 1)
-        order.setAttribute("aria-label", `Edit the position for ${page.sourceName}`)
-        order.title = "Click to move this page by number"
+    elements.pages.replaceChildren(fragment)
+    focusOrderEditorIfNeeded()
+  }
+
+  function refreshPageCards() {
+    for (let index = 0; index < state.pages.length; index += 1) {
+      updatePageCard(state.pages[index], index)
+    }
+
+    focusOrderEditorIfNeeded()
+  }
+
+  function createPageCard(page) {
+    const card = document.createElement("article")
+    card.className = "page-card"
+    card.draggable = true
+    card.dataset.pageId = String(page.id)
+
+    const header = document.createElement("div")
+    header.className = "page-card-header"
+
+    const orderSlot = document.createElement("div")
+    orderSlot.className = "page-order-slot"
+
+    const deleteButton = document.createElement("button")
+    deleteButton.type = "button"
+    deleteButton.className = "button delete-button"
+    deleteButton.dataset.action = "delete-page"
+    deleteButton.dataset.preventCardDrag = "true"
+    deleteButton.textContent = "Delete"
+
+    header.append(orderSlot, deleteButton)
+
+    const previewButton = document.createElement("button")
+    previewButton.type = "button"
+    previewButton.className = "page-preview"
+    previewButton.dataset.action = "open-preview"
+    previewButton.dataset.preventCardDrag = "true"
+
+    const previewContent = document.createElement("div")
+    previewContent.className = "page-preview-content"
+    previewButton.append(previewContent)
+
+    const meta = document.createElement("div")
+    meta.className = "page-meta"
+
+    const title = document.createElement("p")
+    title.className = "page-title"
+    title.textContent = page.sourceName
+
+    const source = document.createElement("p")
+    source.className = "page-source"
+    source.textContent = `Original page ${page.sourcePageNumber}`
+
+    const note = document.createElement("p")
+    note.className = "page-note"
+    note.textContent = "Click the number to jump positions or drag to reorder"
+
+    meta.append(title, source, note)
+    card.append(header, previewButton, meta)
+
+    pageElements.set(page.id, card)
+    pageRefs.set(page.id, {
+      orderSlot,
+      deleteButton,
+      previewButton,
+      previewContent,
+      title,
+      source,
+      note,
+    })
+
+    if (thumbnailObserver) {
+      thumbnailObserver.observe(previewButton)
+    }
+
+    return card
+  }
+
+  function updatePageCard(page, index) {
+    const card = pageElements.get(page.id)
+    const refs = pageRefs.get(page.id)
+    if (!card || !refs) {
+      return
+    }
+
+    card.classList.toggle("dragging", state.dragPageId === page.id)
+    card.draggable = !isBusy()
+
+    renderPageOrderControl(page, index, refs.orderSlot)
+
+    refs.deleteButton.disabled = isBusy()
+    refs.deleteButton.setAttribute("aria-label", `Delete page ${page.sourcePageNumber} from ${page.sourceName}`)
+    refs.previewButton.disabled = isBusy()
+    refs.previewButton.setAttribute("aria-label", `Open a larger preview for ${page.sourceName}, page ${page.sourcePageNumber}`)
+
+    renderPagePreview(page, refs.previewButton, refs.previewContent)
+  }
+
+  function renderPageOrderControl(page, index, orderSlot) {
+    const isEditing = state.editingPageId === page.id
+    const currentControl = orderSlot.firstElementChild
+
+    if (isEditing) {
+      if (!(currentControl instanceof HTMLInputElement)) {
+        const input = document.createElement("input")
+        input.type = "number"
+        input.className = "page-order page-order-input"
+        input.dataset.action = "commit-order"
+        input.dataset.pageId = String(page.id)
+        input.dataset.preventCardDrag = "true"
+        input.inputMode = "numeric"
+        orderSlot.replaceChildren(input)
       }
 
-      const deleteButton = document.createElement("button")
-      deleteButton.type = "button"
-      deleteButton.className = "button delete-button"
-      deleteButton.dataset.action = "delete-page"
-      deleteButton.dataset.preventCardDrag = "true"
-      deleteButton.textContent = "Delete"
-      deleteButton.setAttribute("aria-label", `Delete page ${page.sourcePageNumber} from ${page.sourceName}`)
+      const input = orderSlot.firstElementChild
+      input.min = "1"
+      input.max = String(state.pages.length)
+      input.value = String(index + 1)
+      input.setAttribute("aria-label", `Enter a new position for ${page.sourceName}`)
+      input.disabled = isBusy()
+      return
+    }
 
-      header.append(order, deleteButton)
+    if (!(currentControl instanceof HTMLButtonElement)) {
+      const button = document.createElement("button")
+      button.type = "button"
+      button.className = "page-order page-order-button"
+      button.dataset.action = "edit-order"
+      button.dataset.preventCardDrag = "true"
+      orderSlot.replaceChildren(button)
+    }
 
-      const preview = document.createElement("div")
-      preview.className = "page-preview"
+    const button = orderSlot.firstElementChild
+    button.textContent = String(index + 1)
+    button.disabled = isBusy()
+    button.title = "Click to move this page by number"
+    button.setAttribute("aria-label", `Edit the position for ${page.sourceName}`)
+  }
+
+  function renderPagePreview(page, previewButton, previewContent) {
+    previewButton.classList.toggle("is-ready", page.thumbnailStatus === "ready")
+    previewButton.classList.toggle("is-loading", page.thumbnailStatus === "loading" || page.thumbnailStatus === "queued")
+    previewButton.classList.toggle("is-error", page.thumbnailStatus === "error")
+
+    if (page.thumbnailStatus === "ready" && page.thumbnailUrl) {
+      const existingImage = previewContent.querySelector("img")
+      if (existingImage && existingImage.src === page.thumbnailUrl) {
+        return
+      }
 
       const image = document.createElement("img")
       image.src = page.thumbnailUrl
       image.alt = `${page.sourceName}, page ${page.sourcePageNumber}`
-      preview.append(image)
-
-      const meta = document.createElement("div")
-      meta.className = "page-meta"
-
-      const title = document.createElement("p")
-      title.className = "page-title"
-      title.textContent = page.sourceName
-
-      const source = document.createElement("p")
-      source.className = "page-source"
-      source.textContent = `Original page ${page.sourcePageNumber}`
-
-      meta.append(title, source)
-      card.append(header, preview, meta)
-      elements.pages.append(card)
-    })
-
-    if (state.editingPageId != null) {
-      requestAnimationFrame(() => {
-        const activeEditor = elements.pages.querySelector("[data-action='commit-order']")
-        if (!activeEditor) {
-          return
-        }
-
-        activeEditor.focus()
-        activeEditor.select()
-      })
+      previewContent.replaceChildren(image)
+      return
     }
+
+    const placeholder = document.createElement("div")
+    placeholder.className = "page-preview-placeholder"
+
+    const label = document.createElement("p")
+    label.className = "page-preview-status"
+    if (page.thumbnailStatus === "error") {
+      label.textContent = "Preview unavailable"
+    } else if (page.thumbnailStatus === "loading") {
+      label.textContent = "Rendering preview..."
+    } else {
+      label.textContent = "No preview available yet"
+    }
+
+    placeholder.append(label)
+    previewContent.replaceChildren(placeholder)
   }
 
-  function renderButtons() {
-    const canEdit = state.pages.length > 0 && !state.isImporting && !state.isExporting
-    elements.exportButton.disabled = !canEdit
-    elements.clearButton.disabled = state.pages.length === 0 && state.messages.length === 0
+  function focusOrderEditorIfNeeded() {
+    if (state.editingPageId == null) {
+      return
+    }
+
+    requestAnimationFrame(() => {
+      const activeEditor = elements.pages.querySelector("[data-action='commit-order']")
+      if (!activeEditor) {
+        return
+      }
+
+      activeEditor.focus()
+      activeEditor.select()
+    })
   }
 
   function pushMessage(kind, text) {
@@ -635,7 +832,7 @@ document.addEventListener("DOMContentLoaded", () => {
     state.dragPageId = null
     clearDropMarkers()
     stopAutoScroll()
-    render()
+    refreshPageCards()
   }
 
   function beginOrderEdit(pageId) {
@@ -644,7 +841,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     state.editingPageId = pageId
-    render()
+    refreshPageCards()
   }
 
   function cancelOrderEdit() {
@@ -653,8 +850,8 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     state.editingPageId = null
-    state.statusText = "Page move canceled"
-    render()
+    setStatus("Page move canceled")
+    refreshPageCards()
   }
 
   function commitOrderEdit(pageId, rawValue) {
@@ -664,6 +861,243 @@ document.addEventListener("DOMContentLoaded", () => {
 
     state.editingPageId = null
     movePageToPosition(pageId, rawValue)
+  }
+
+  async function openPreview(pageId) {
+    const page = getPageById(pageId)
+    if (!page) {
+      return
+    }
+
+    const source = state.sources.get(page.sourceId)
+    if (!source) {
+      return
+    }
+
+    state.previewPageId = pageId
+    state.previewRenderToken += 1
+    const renderToken = state.previewRenderToken
+
+    elements.previewModal.hidden = false
+    elements.previewKicker.textContent = page.sourceName
+    elements.previewTitle.textContent = `Page ${page.sourcePageNumber} preview`
+    renderPreviewStatus("Rendering larger preview...")
+    document.body.style.overflow = "hidden"
+
+    try {
+      const pdfjsDocument = await getSourcePdfJsDocument(source)
+      if (renderToken !== state.previewRenderToken) {
+        return
+      }
+
+      const previewPage = await pdfjsDocument.getPage(page.sourcePageNumber)
+      const baseViewport = previewPage.getViewport({ scale: 1 })
+      const stageWidth = Math.max(Math.min(elements.previewStage.clientWidth - 40, 1000), 320)
+      const scale = stageWidth / baseViewport.width
+      const viewport = previewPage.getViewport({ scale })
+      const canvas = document.createElement("canvas")
+      const context = canvas.getContext("2d", {
+        alpha: false,
+        willReadFrequently: true,
+      })
+      canvas.width = Math.ceil(viewport.width)
+      canvas.height = Math.ceil(viewport.height)
+
+      await previewPage.render({
+        canvasContext: context,
+        viewport,
+      }).promise
+
+      if (renderToken !== state.previewRenderToken) {
+        return
+      }
+
+      elements.previewStage.replaceChildren(canvas)
+    } catch (error) {
+      console.error(error)
+      renderPreviewStatus("This preview could not be rendered.")
+    }
+  }
+
+  function closePreview() {
+    state.previewPageId = null
+    state.previewRenderToken += 1
+    elements.previewModal.hidden = true
+    elements.previewKicker.textContent = "Preview"
+    elements.previewTitle.textContent = "PDF page preview"
+    elements.previewStage.replaceChildren()
+    document.body.style.overflow = ""
+  }
+
+  function handleThumbnailIntersection(entries) {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) {
+        continue
+      }
+
+      const pageId = Number(entry.target.closest("[data-page-id]")?.dataset.pageId)
+      queueThumbnailRender(pageId)
+    }
+  }
+
+  function queueThumbnailRender(pageId) {
+    const page = getPageById(pageId)
+    if (!page || page.thumbnailStatus === "ready" || page.thumbnailStatus === "loading" || queuedThumbnailIds.has(pageId)) {
+      return
+    }
+
+    page.thumbnailStatus = "queued"
+    queuedThumbnailIds.add(pageId)
+    thumbnailQueue.push(pageId)
+    updateSinglePageCard(pageId)
+    processThumbnailQueue()
+  }
+
+  function processThumbnailQueue() {
+    while (activeThumbnailJobs < THUMBNAIL_CONCURRENCY && thumbnailQueue.length > 0) {
+      const nextPageId = thumbnailQueue.shift()
+      queuedThumbnailIds.delete(nextPageId)
+      activeThumbnailJobs += 1
+      renderThumbnailForPage(nextPageId).finally(() => {
+        activeThumbnailJobs -= 1
+        processThumbnailQueue()
+      })
+    }
+  }
+
+  async function renderThumbnailForPage(pageId) {
+    const page = getPageById(pageId)
+    if (!page) {
+      return
+    }
+
+    page.thumbnailStatus = "loading"
+    updateSinglePageCard(pageId)
+
+    const source = state.sources.get(page.sourceId)
+    if (!source) {
+      return
+    }
+
+    try {
+      const pdfjsDocument = await getSourcePdfJsDocument(source)
+      const pdfPage = await pdfjsDocument.getPage(page.sourcePageNumber)
+      const baseViewport = pdfPage.getViewport({ scale: 1 })
+      const scale = THUMBNAIL_WIDTH / baseViewport.width
+      const viewport = pdfPage.getViewport({ scale })
+      const canvas = document.createElement("canvas")
+      const context = canvas.getContext("2d", {
+        alpha: false,
+        willReadFrequently: true,
+      })
+      canvas.width = Math.ceil(viewport.width)
+      canvas.height = Math.ceil(viewport.height)
+
+      await pdfPage.render({
+        canvasContext: context,
+        viewport,
+      }).promise
+
+      const blob = await canvasToBlob(canvas)
+      const freshPage = getPageById(pageId)
+      if (!freshPage || !blob) {
+        return
+      }
+
+      cleanupThumbnailForPage(freshPage)
+      freshPage.thumbnailUrl = URL.createObjectURL(blob)
+      freshPage.thumbnailStatus = "ready"
+      updateSinglePageCard(pageId)
+    } catch (error) {
+      console.error(error)
+      const freshPage = getPageById(pageId)
+      if (!freshPage) {
+        return
+      }
+
+      freshPage.thumbnailStatus = "error"
+      updateSinglePageCard(pageId)
+    }
+  }
+
+  async function getSourcePdfJsDocument(source) {
+    if (source.pdfjsDocument) {
+      return source.pdfjsDocument
+    }
+
+    if (!source.pdfjsDocumentPromise) {
+      source.pdfjsDocumentPromise = window.pdfjsLib.getDocument({
+        data: source.bytes.slice(),
+      }).promise.then((document) => {
+        source.pdfjsDocument = document
+        return document
+      }).catch((error) => {
+        source.pdfjsDocumentPromise = null
+        throw error
+      })
+    }
+
+    return source.pdfjsDocumentPromise
+  }
+
+  function cleanupSource(sourceId) {
+    const source = state.sources.get(sourceId)
+    if (!source) {
+      return
+    }
+
+    state.sources.delete(sourceId)
+
+    if (source.pdfjsDocument && typeof source.pdfjsDocument.destroy === "function") {
+      source.pdfjsDocument.destroy()
+      return
+    }
+
+    if (source.pdfjsDocumentPromise) {
+      source.pdfjsDocumentPromise.then((document) => {
+        if (typeof document.destroy === "function") {
+          document.destroy()
+        }
+      }).catch(() => {})
+    }
+  }
+
+  function cleanupThumbnailForPage(page) {
+    if (page.thumbnailUrl) {
+      URL.revokeObjectURL(page.thumbnailUrl)
+      page.thumbnailUrl = null
+    }
+  }
+
+  function removePageCard(pageId) {
+    const card = pageElements.get(pageId)
+    const refs = pageRefs.get(pageId)
+
+    if (thumbnailObserver && refs?.previewButton) {
+      thumbnailObserver.unobserve(refs.previewButton)
+    }
+
+    if (card) {
+      card.remove()
+    }
+
+    pageElements.delete(pageId)
+    pageRefs.delete(pageId)
+    queuedThumbnailIds.delete(pageId)
+  }
+
+  function updateSinglePageCard(pageId) {
+    const page = getPageById(pageId)
+    if (!page) {
+      return
+    }
+
+    const index = state.pages.findIndex((item) => item.id === pageId)
+    if (index === -1) {
+      return
+    }
+
+    updatePageCard(page, index)
   }
 
   function getPlacement(card, event) {
@@ -734,17 +1168,43 @@ document.addEventListener("DOMContentLoaded", () => {
     state.autoScrollSpeed = 0
   }
 
-  function getActiveSourceCount() {
-    return new Set(state.pages.map((page) => page.sourceId)).size
-  }
-
   function pruneUnusedSources() {
     const activeSourceIds = new Set(state.pages.map((page) => page.sourceId))
-    for (const sourceId of state.sources.keys()) {
+    for (const sourceId of Array.from(state.sources.keys())) {
       if (!activeSourceIds.has(sourceId)) {
-        state.sources.delete(sourceId)
+        cleanupSource(sourceId)
       }
     }
+  }
+
+  function canImportFiles() {
+    return hasPdfLib && hasPdfJs && !isBusy()
+  }
+
+  function isBusy() {
+    return state.isImporting || state.isExporting
+  }
+
+  function refreshPageInteractivity() {
+    for (const [pageId, card] of pageElements.entries()) {
+      const refs = pageRefs.get(pageId)
+      card.draggable = !isBusy()
+      if (!refs) {
+        continue
+      }
+
+      refs.deleteButton.disabled = isBusy()
+      refs.previewButton.disabled = isBusy()
+
+      const control = refs.orderSlot.firstElementChild
+      if (control instanceof HTMLButtonElement || control instanceof HTMLInputElement) {
+        control.disabled = isBusy()
+      }
+    }
+  }
+
+  function getPageById(pageId) {
+    return state.pages.find((page) => page.id === pageId) || null
   }
 
   function hasFiles(event) {
@@ -758,5 +1218,23 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function clamp(value, min, max) {
     return Math.min(Math.max(value, min), max)
+  }
+
+  function renderPreviewStatus(text) {
+    const status = document.createElement("p")
+    status.className = "preview-status"
+    status.textContent = text
+    elements.previewStage.replaceChildren(status)
+  }
+
+  function setStatus(text) {
+    state.statusText = text
+    renderStatus()
+  }
+
+  function canvasToBlob(canvas) {
+    return new Promise((resolve) => {
+      canvas.toBlob((blob) => resolve(blob), "image/png")
+    })
   }
 })
