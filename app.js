@@ -660,11 +660,7 @@ document.addEventListener("DOMContentLoaded", () => {
     source.className = "page-source"
     source.textContent = `Original page ${page.sourcePageNumber}`
 
-    const note = document.createElement("p")
-    note.className = "page-note"
-    note.textContent = "Click the number to jump positions or drag to reorder"
-
-    meta.append(title, source, note)
+    meta.append(title, source)
     card.append(header, previewButton, meta)
 
     pageElements.set(page.id, card)
@@ -675,7 +671,6 @@ document.addEventListener("DOMContentLoaded", () => {
       previewContent,
       title,
       source,
-      note,
     })
 
     if (thumbnailObserver) {
